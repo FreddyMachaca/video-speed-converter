@@ -3,6 +3,7 @@ import os
 import queue
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import tkinter as tk
@@ -153,9 +154,12 @@ class ConversorApp:
         self.done_jobs = 0
         self.ok_jobs = 0
         self.fail_jobs = 0
+        self.started_at = None
+        self.timer_after_id = None
 
         self.status_var = tk.StringVar(value="Listo para convertir")
         self.counter_var = tk.StringVar(value="0/0")
+        self.timer_var = tk.StringVar(value="Tiempo total: 00:00:00")
         self.source_var = tk.StringVar(value=f"Entrada: {self.input_dir}")
         self.dest_var = tk.StringVar(value=f"Salida: {self.output_root}")
         self.template1_var = tk.StringVar(value=self.templates[0])
@@ -248,6 +252,40 @@ class ConversorApp:
         index = 0 if self.active_template == 1 else 1
         return self.templates[index]
 
+    def format_elapsed(self, total_seconds: int) -> str:
+        hours, remainder = divmod(max(0, int(total_seconds)), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02}:{minutes:02}:{seconds:02}"
+
+    def get_elapsed_seconds(self) -> int:
+        if self.started_at is None:
+            return 0
+        return max(0, int(time.monotonic() - self.started_at))
+
+    def set_timer_label(self, elapsed_seconds: int):
+        self.timer_var.set(f"Tiempo total: {self.format_elapsed(elapsed_seconds)}")
+
+    def start_timer(self):
+        self.started_at = time.monotonic()
+        self.set_timer_label(0)
+        self.schedule_timer_update()
+
+    def schedule_timer_update(self):
+        if not self.running or self.started_at is None:
+            self.timer_after_id = None
+            return
+        self.set_timer_label(self.get_elapsed_seconds())
+        self.timer_after_id = self.root.after(250, self.schedule_timer_update)
+
+    def stop_timer(self) -> int:
+        elapsed_seconds = self.get_elapsed_seconds()
+        if self.timer_after_id is not None:
+            self.root.after_cancel(self.timer_after_id)
+            self.timer_after_id = None
+        self.set_timer_label(elapsed_seconds)
+        self.started_at = None
+        return elapsed_seconds
+
     def build_ui(self):
         frame = ttk.Frame(self.root, padding=14)
         frame.pack(fill="both", expand=True)
@@ -294,6 +332,9 @@ class ConversorApp:
 
         self.start_button = ttk.Button(controls, text="Iniciar", command=self.start)
         self.start_button.pack(side="left")
+
+        self.timer_label = ttk.Label(controls, textvariable=self.timer_var, font=("Segoe UI", 10, "bold"))
+        self.timer_label.pack(side="right", padx=(0, 12))
 
         self.counter_label = ttk.Label(controls, textvariable=self.counter_var, font=("Segoe UI", 10, "bold"))
         self.counter_label.pack(side="right")
@@ -359,6 +400,7 @@ class ConversorApp:
         self.status_var.set(f"Procesando {len(videos)} video(s) con {MAX_WORKERS} proceso(s) en paralelo")
         self.start_button.configure(state="disabled")
         self.set_templates_controls_state(False)
+        self.start_timer()
         self.clear_log()
         self.append_log(f"Videos detectados: {len(videos)}")
         self.append_log(f"Tareas totales: {self.total_jobs}")
@@ -415,14 +457,20 @@ class ConversorApp:
 
             if kind == "done":
                 self.running = False
+                elapsed_seconds = self.stop_timer()
+                elapsed_text = self.format_elapsed(elapsed_seconds)
                 self.start_button.configure(state="normal")
                 self.set_templates_controls_state(True)
                 self.status_var.set("Conversion terminada")
                 self.append_log(f"Finalizado. OK: {self.ok_jobs} | Errores: {self.fail_jobs}")
+                self.append_log(f"Tiempo total: {elapsed_text}")
                 if self.fail_jobs == 0:
-                    messagebox.showinfo("Listo", "Proceso completado sin errores.")
+                    messagebox.showinfo("Listo", f"Proceso completado sin errores.\nTiempo total: {elapsed_text}")
                 else:
-                    messagebox.showwarning("Finalizado", f"Proceso completado con {self.fail_jobs} error(es).")
+                    messagebox.showwarning(
+                        "Finalizado",
+                        f"Proceso completado con {self.fail_jobs} error(es).\nTiempo total: {elapsed_text}",
+                    )
 
         self.root.after(120, self.on_event)
 
@@ -431,6 +479,9 @@ class ConversorApp:
             leave = messagebox.askyesno("Salir", "Hay conversiones en curso. Deseas salir?")
             if not leave:
                 return
+        if self.timer_after_id is not None:
+            self.root.after_cancel(self.timer_after_id)
+            self.timer_after_id = None
         self.root.destroy()
 
     def run(self):
