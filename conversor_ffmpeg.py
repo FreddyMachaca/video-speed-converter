@@ -261,11 +261,11 @@ class ConversorApp:
         template_frame = ttk.LabelFrame(frame, text="Plantillas", padding=10)
         template_frame.pack(fill="x", pady=(10, 8))
 
-        ttk.Label(template_frame, text="Plantilla 1").grid(row=0, column=0, sticky="w")
+        ttk.Label(template_frame, text="Plantilla 1 (cuentas secundarias)").grid(row=0, column=0, sticky="w")
         self.template1_entry = ttk.Entry(template_frame, textvariable=self.template1_var)
         self.template1_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=(0, 6))
 
-        ttk.Label(template_frame, text="Plantilla 2").grid(row=1, column=0, sticky="w")
+        ttk.Label(template_frame, text="Plantilla 2 (cuentas primarias)").grid(row=1, column=0, sticky="w")
         self.template2_entry = ttk.Entry(template_frame, textvariable=self.template2_var)
         self.template2_entry.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(0, 6))
 
