@@ -1,3 +1,4 @@
+import json
 import os
 import queue
 import subprocess
@@ -8,7 +9,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
-SUFFIX = " @bolivia.news4 #LaPazBolivia #Bolivia #BoliviaNewsBO465"
+TEMPLATE_CONFIG_FILENAME = "plantillas.json"
 TARGETS = [("1.1", 1.1), ("1.2", 1.2)]
 VIDEO_EXTENSIONS = {
     ".mp4",
@@ -70,9 +71,12 @@ def detect_audio_stream(video_path: Path):
     return bool(result.stdout.strip())
 
 
-def output_name_for(video_path: Path) -> str:
+def output_name_for(video_path: Path, suffix: str) -> str:
     ext = video_path.suffix if video_path.suffix else ".mp4"
-    return f"{video_path.stem}{SUFFIX}{ext}"
+    clean_suffix = suffix.strip()
+    if clean_suffix:
+        return f"{video_path.stem} {clean_suffix}{ext}"
+    return f"{video_path.stem}{ext}"
 
 
 def ffmpeg_command(input_file: Path, output_file: Path, speed: float, with_audio: bool):
@@ -140,6 +144,8 @@ class ConversorApp:
         self.base_dir = Path(__file__).resolve().parent
         self.input_dir = self.base_dir / "VIDEOS ORIGINALES"
         self.output_root = self.base_dir / "VIDEOS CONVERTIDOS"
+        self.template_config_path = self.base_dir / TEMPLATE_CONFIG_FILENAME
+        self.templates, self.active_template = self.load_templates()
 
         self.event_queue = queue.Queue()
         self.running = False
@@ -152,10 +158,95 @@ class ConversorApp:
         self.counter_var = tk.StringVar(value="0/0")
         self.source_var = tk.StringVar(value=f"Entrada: {self.input_dir}")
         self.dest_var = tk.StringVar(value=f"Salida: {self.output_root}")
+        self.template1_var = tk.StringVar(value=self.templates[0])
+        self.template2_var = tk.StringVar(value=self.templates[1])
 
         self.build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.after(120, self.on_event)
+
+    def load_templates(self):
+        templates = ["", ""]
+        active_template = 1
+        if not self.template_config_path.exists():
+            try:
+                self.write_templates_file(templates, active_template)
+            except OSError:
+                pass
+            return templates, active_template
+
+        try:
+            data = json.loads(self.template_config_path.read_text(encoding="utf-8"))
+            loaded_templates = data.get("templates")
+            if isinstance(loaded_templates, list):
+                if len(loaded_templates) > 0 and isinstance(loaded_templates[0], str):
+                    templates[0] = loaded_templates[0].strip()
+                if len(loaded_templates) > 1 and isinstance(loaded_templates[1], str):
+                    templates[1] = loaded_templates[1].strip()
+            loaded_active = data.get("active_template")
+            if loaded_active in (1, 2):
+                active_template = loaded_active
+        except Exception:
+            pass
+        try:
+            self.write_templates_file(templates, active_template)
+        except OSError:
+            pass
+        return templates, active_template
+
+    def write_templates_file(self, templates, active_template):
+        data = {
+            "templates": templates,
+            "active_template": active_template,
+        }
+        self.template_config_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def sync_templates_from_ui(self, notify=True):
+        template_1 = self.template1_var.get().strip()
+        template_2 = self.template2_var.get().strip()
+        if not template_1 or not template_2:
+            messagebox.showerror("Error", "Las dos plantillas son obligatorias.")
+            return False
+
+        selected_index = self.template_selector.current()
+        if selected_index not in (0, 1):
+            selected_index = 0
+            self.template_selector.current(0)
+
+        self.templates = [template_1, template_2]
+        self.active_template = selected_index + 1
+
+        try:
+            self.write_templates_file(self.templates, self.active_template)
+        except OSError as ex:
+            messagebox.showerror("Error", f"No se pudo guardar plantillas.json: {ex}")
+            return False
+
+        if notify:
+            self.status_var.set(f"Plantillas guardadas. Activa: {self.active_template}")
+            self.append_log(f"Plantillas guardadas. Activa: {self.active_template}")
+        return True
+
+    def on_template_selected(self, _event=None):
+        self.sync_templates_from_ui(notify=False)
+
+    def save_templates(self):
+        self.sync_templates_from_ui(notify=True)
+
+    def set_templates_controls_state(self, enabled):
+        state = "normal" if enabled else "disabled"
+        combo_state = "readonly" if enabled else "disabled"
+        self.template1_entry.configure(state=state)
+        self.template2_entry.configure(state=state)
+        self.template_selector.configure(state=combo_state)
+        self.save_templates_button.configure(state=state)
+
+    def get_active_template_text(self):
+        index = 0 if self.active_template == 1 else 1
+        return self.templates[index]
 
     def build_ui(self):
         frame = ttk.Frame(self.root, padding=14)
@@ -166,6 +257,37 @@ class ConversorApp:
 
         ttk.Label(frame, textvariable=self.source_var).pack(anchor="w", pady=(8, 0))
         ttk.Label(frame, textvariable=self.dest_var).pack(anchor="w")
+
+        template_frame = ttk.LabelFrame(frame, text="Plantillas", padding=10)
+        template_frame.pack(fill="x", pady=(10, 8))
+
+        ttk.Label(template_frame, text="Plantilla 1").grid(row=0, column=0, sticky="w")
+        self.template1_entry = ttk.Entry(template_frame, textvariable=self.template1_var)
+        self.template1_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=(0, 6))
+
+        ttk.Label(template_frame, text="Plantilla 2").grid(row=1, column=0, sticky="w")
+        self.template2_entry = ttk.Entry(template_frame, textvariable=self.template2_var)
+        self.template2_entry.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(0, 6))
+
+        ttk.Label(template_frame, text="Activa").grid(row=2, column=0, sticky="w")
+        template_actions = ttk.Frame(template_frame)
+        template_actions.grid(row=2, column=1, sticky="ew", padx=(8, 0))
+
+        self.template_selector = ttk.Combobox(
+            template_actions,
+            state="readonly",
+            values=["Plantilla 1", "Plantilla 2"],
+            width=14,
+        )
+        self.template_selector.pack(side="left")
+        self.template_selector.current(0 if self.active_template == 1 else 1)
+        self.template_selector.bind("<<ComboboxSelected>>", self.on_template_selected)
+
+        self.save_templates_button = ttk.Button(template_actions, text="Guardar plantillas", command=self.save_templates)
+        self.save_templates_button.pack(side="right")
+
+        template_frame.columnconfigure(1, weight=1)
+        template_actions.columnconfigure(0, weight=1)
 
         controls = ttk.Frame(frame)
         controls.pack(fill="x", pady=(12, 8))
@@ -204,6 +326,8 @@ class ConversorApp:
     def start(self):
         if self.running:
             return
+        if not self.sync_templates_from_ui(notify=False):
+            return
         if not has_ffmpeg():
             messagebox.showerror("Error", "No se encontro ffmpeg en PATH.")
             self.status_var.set("Error: ffmpeg no disponible")
@@ -219,9 +343,10 @@ class ConversorApp:
             return
 
         jobs = []
+        active_template_text = self.get_active_template_text()
         for video in videos:
             for folder_name, speed in TARGETS:
-                jobs.append((video, folder_name, speed))
+                jobs.append((video, folder_name, speed, active_template_text))
 
         self.total_jobs = len(jobs)
         self.done_jobs = 0
@@ -233,18 +358,20 @@ class ConversorApp:
         self.counter_var.set(f"0/{self.total_jobs}")
         self.status_var.set(f"Procesando {len(videos)} video(s) con {MAX_WORKERS} proceso(s) en paralelo")
         self.start_button.configure(state="disabled")
+        self.set_templates_controls_state(False)
         self.clear_log()
         self.append_log(f"Videos detectados: {len(videos)}")
         self.append_log(f"Tareas totales: {self.total_jobs}")
+        self.append_log(f"Plantilla activa: {self.active_template}")
 
         worker = threading.Thread(target=self.worker, args=(jobs,), daemon=True)
         worker.start()
 
     def convert_one(self, job):
-        video, folder_name, speed = job
+        video, folder_name, speed, suffix = job
         out_dir = self.output_root / folder_name
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_name = output_name_for(video)
+        out_name = output_name_for(video, suffix)
         out_file = out_dir / out_name
 
         ok, err = run_ffmpeg(video, out_file, speed)
@@ -289,6 +416,7 @@ class ConversorApp:
             if kind == "done":
                 self.running = False
                 self.start_button.configure(state="normal")
+                self.set_templates_controls_state(True)
                 self.status_var.set("Conversion terminada")
                 self.append_log(f"Finalizado. OK: {self.ok_jobs} | Errores: {self.fail_jobs}")
                 if self.fail_jobs == 0:
