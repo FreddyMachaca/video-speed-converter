@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -25,7 +26,24 @@ VIDEO_EXTENSIONS = {
     ".mpeg",
     ".mpg",
 }
-MAX_WORKERS = max(1, min(3, os.cpu_count() or 1))
+CPU_COUNT = os.cpu_count() or 1
+
+
+def get_positive_int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
+DEFAULT_WORKERS = 2 if CPU_COUNT >= 6 else 1
+MAX_WORKERS = min(CPU_COUNT, get_positive_int_env("CONVERSOR_WORKERS", DEFAULT_WORKERS))
+FFMPEG_THREADS_PER_PROCESS = max(1, CPU_COUNT // MAX_WORKERS)
+HW_ENCODER_CANDIDATES = ("h264_nvenc", "h264_qsv", "h264_amf")
 
 
 def is_video_file(path: Path) -> bool:
@@ -36,13 +54,56 @@ def has_ffmpeg() -> bool:
     try:
         result = subprocess.run(
             ["ffmpeg", "-version"],
-            stdout=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
         )
         return result.returncode == 0
     except FileNotFoundError:
         return False
+
+
+def encoder_works(codec: str) -> bool:
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:s=64x64:r=1",
+        "-frames:v",
+        "1",
+        "-an",
+        "-c:v",
+        codec,
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError:
+        return False
+    return result.returncode == 0
+
+
+@lru_cache(maxsize=1)
+def resolve_video_codec() -> str:
+    preferred = os.getenv("CONVERSOR_VIDEO_CODEC", "auto").strip().lower()
+    if preferred and preferred != "auto":
+        return preferred
+
+    for codec in HW_ENCODER_CANDIDATES:
+        if encoder_works(codec):
+            return codec
+    return "libx264"
 
 
 def detect_audio_stream(video_path: Path):
@@ -80,26 +141,28 @@ def output_name_for(video_path: Path, suffix: str) -> str:
     return f"{video_path.stem}{ext}"
 
 
-def ffmpeg_command(input_file: Path, output_file: Path, speed: float, with_audio: bool):
+def video_codec_options(codec: str):
+    if codec == "libx264":
+        return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22"]
+    return ["-c:v", codec]
+
+
+def ffmpeg_command(input_file: Path, output_file: Path, speed: float, with_audio: bool, codec: str):
     cmd = [
         "ffmpeg",
         "-y",
         "-hide_banner",
         "-loglevel",
         "error",
+        "-threads",
+        str(FFMPEG_THREADS_PER_PROCESS),
         "-i",
         str(input_file),
         "-vf",
         f"setpts=PTS/{speed}",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "22",
-        "-movflags",
-        "+faststart",
     ]
+    cmd.extend(video_codec_options(codec))
+    cmd.extend(["-movflags", "+faststart"])
     if with_audio:
         cmd.extend(["-af", f"atempo={speed}", "-c:a", "aac", "-b:a", "192k"])
     else:
@@ -108,31 +171,50 @@ def ffmpeg_command(input_file: Path, output_file: Path, speed: float, with_audio
     return cmd
 
 
-def run_ffmpeg(input_file: Path, output_file: Path, speed: float):
-    audio_state = detect_audio_stream(input_file)
+def run_ffmpeg(input_file: Path, output_file: Path, speed: float, audio_state, preferred_codec: str):
+    codecs_to_try = [preferred_codec]
+    if preferred_codec != "libx264":
+        codecs_to_try.append("libx264")
 
-    def run_once(with_audio: bool):
-        cmd = ffmpeg_command(input_file, output_file, speed, with_audio)
+    def run_once(with_audio: bool, codec: str):
+        cmd = ffmpeg_command(input_file, output_file, speed, with_audio, codec)
         result = subprocess.run(
             cmd,
-            stdout=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
         )
-        return result.returncode == 0, (result.stderr or "").strip()
+        return result.returncode == 0, (result.stderr or "").strip(), codec
 
-    if audio_state is True:
-        return run_once(True)
-    if audio_state is False:
-        return run_once(False)
+    last_error = ""
+    last_codec = preferred_codec
+    for codec in codecs_to_try:
+        if audio_state is True:
+            ok, err, used_codec = run_once(True, codec)
+            if ok:
+                return ok, err, used_codec
+            last_error = err
+            last_codec = used_codec
+            continue
 
-    ok, err = run_once(True)
-    if ok:
-        return ok, err
-    ok2, err2 = run_once(False)
-    if ok2:
-        return ok2, err2
-    return False, err2 or err
+        if audio_state is False:
+            ok, err, used_codec = run_once(False, codec)
+            if ok:
+                return ok, err, used_codec
+            last_error = err
+            last_codec = used_codec
+            continue
+
+        ok, err, used_codec = run_once(True, codec)
+        if ok:
+            return ok, err, used_codec
+        ok2, err2, used_codec2 = run_once(False, codec)
+        if ok2:
+            return ok2, err2, used_codec2
+        last_error = err2 or err
+        last_codec = used_codec2
+
+    return False, last_error, last_codec
 
 
 class ConversorApp:
@@ -156,6 +238,7 @@ class ConversorApp:
         self.fail_jobs = 0
         self.started_at = None
         self.timer_after_id = None
+        self.video_codec = "libx264"
 
         self.status_var = tk.StringVar(value="Listo para convertir")
         self.counter_var = tk.StringVar(value="0/0")
@@ -384,10 +467,12 @@ class ConversorApp:
             return
 
         jobs = []
+        audio_map = {video: detect_audio_stream(video) for video in videos}
         active_template_text = self.get_active_template_text()
+        self.video_codec = resolve_video_codec()
         for video in videos:
             for folder_name, speed in TARGETS:
-                jobs.append((video, folder_name, speed, active_template_text))
+                jobs.append((video, folder_name, speed, active_template_text, audio_map.get(video)))
 
         self.total_jobs = len(jobs)
         self.done_jobs = 0
@@ -404,21 +489,24 @@ class ConversorApp:
         self.clear_log()
         self.append_log(f"Videos detectados: {len(videos)}")
         self.append_log(f"Tareas totales: {self.total_jobs}")
+        self.append_log(f"Codec de video: {self.video_codec}")
+        self.append_log(f"Procesos en paralelo: {MAX_WORKERS}")
+        self.append_log(f"Hilos por proceso FFmpeg: {FFMPEG_THREADS_PER_PROCESS}")
         self.append_log(f"Plantilla activa: {self.active_template}")
 
         worker = threading.Thread(target=self.worker, args=(jobs,), daemon=True)
         worker.start()
 
     def convert_one(self, job):
-        video, folder_name, speed, suffix = job
+        video, folder_name, speed, suffix, audio_state = job
         out_dir = self.output_root / folder_name
         out_dir.mkdir(parents=True, exist_ok=True)
         out_name = output_name_for(video, suffix)
         out_file = out_dir / out_name
 
-        ok, err = run_ffmpeg(video, out_file, speed)
+        ok, err, used_codec = run_ffmpeg(video, out_file, speed, audio_state, self.video_codec)
         speed_label = folder_name + "x"
-        line = f"[OK] {speed_label} {video.name}" if ok else f"[ERROR] {speed_label} {video.name}"
+        line = f"[OK] {speed_label} {video.name} ({used_codec})" if ok else f"[ERROR] {speed_label} {video.name} ({used_codec})"
         return {"ok": ok, "line": line, "error": err}
 
     def worker(self, jobs):
